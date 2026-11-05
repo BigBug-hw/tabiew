@@ -27,6 +27,13 @@ pub struct Args {
 
     #[arg(
         long,
+        help = "Open the file as raw bytes in the hex viewer (with Parquet structure awareness when applicable).",
+        default_value_t = false
+    )]
+    pub hex: bool,
+
+    #[arg(
+        long,
         help = "Specifies if the input does not contain a header row.",
         default_value_t = false
     )]

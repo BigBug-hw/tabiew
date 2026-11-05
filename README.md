@@ -20,6 +20,7 @@ Tabiew is a lightweight TUI application that allows users to view and query tabu
 - 🗂️ Multi-table functionality
 - 📈 Plotting
 - 🎛️ Remote control
+- 🔬 Raw hex viewer with Parquet structure awareness
 - 🎨 More than 400 beautiful themes
 
 ## Wiki
@@ -155,6 +156,33 @@ Open a URL using curl:
 curl -s "https://raw.githubusercontent.com/wiki/shshemi/tabiew/housing.csv" | tw
 ```
 
+### Hex viewer
+
+Open any file as raw bytes with `--hex`. For Parquet files the viewer also
+parses the on-disk structure — `PAR1` magic, footer length, the Thrift
+`FileMetaData`, schema, row groups, column chunks, and page headers — and maps
+each region back to its byte range, which is useful for learning how Parquet
+works.
+
+```bash
+# Open a parquet file and inspect its byte layout / structure
+tw --hex data.parquet
+
+# Any file works; non-parquet files just show the hex pane
+tw --hex /bin/ls
+
+# Pipe bytes on stdin
+head -c 4096 /dev/urandom | tw --hex -
+
+# No source + TTY → opens a file picker
+tw --hex
+```
+
+You can also open the hex viewer from inside Tabiew:
+
+- press `x` in a pane backed by a local file, or
+- open the command palette (`:`) and run `HexViewer`.
+
 ## Useful Keybindings️
 
 |Key Combination|Functionality|
@@ -175,12 +203,28 @@ curl -s "https://raw.githubusercontent.com/wiki/shshemi/tabiew/housing.csv" | tw
 | `Q`| Quit Application |
 | `:`| Command Palette|
 | `/`| Fuzzy Search|
+| `x`| Open the hex viewer for the pane's backing file|
+
+### Hex viewer keybindings
+
+|Key Combination|Functionality|
+|-|-|
+| `h j k l` or `← ↓ ↑ →`| Move the byte cursor |
+| `Ctrl + u` / `Ctrl + d`| Half page up/down |
+| `Ctrl + b` / `Ctrl + f` or `PageUp` / `PageDown`| Full page up/down |
+| `g` / `G`| Jump to file head / tail |
+| `Home` / `End` (or `Ctrl + 0` / `$`)| Start / end of row |
+| `[` / `]`| Previous / next structure region |
+| `Tab`| Switch focus between the hex pane and the structure tree |
+| `Enter`| In hex: select the region under the cursor in the tree · In tree: collapse/expand the node |
+| `Ctrl + g`| Jump to offset (decimal or `0x…`) |
+| `q` / `Esc`| Close the hex viewer |
 
 ## Useful Commands
 
 Press `:` to open the command palette and type to filter. It lists everything Tabiew can
 do, including `Query`, `Filter`, `Order`, `Select`, `Cast`, `Import`, `Export`, `Schema`,
-`ThemeSelector`, and `ToggleNerdFont`.
+`HexViewer`, `ThemeSelector`, and `ToggleNerdFont`.
 
 Four prefixes skip the list and open an inline editor directly:
 

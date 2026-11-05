@@ -6,6 +6,7 @@ pub mod download_notif;
 pub mod exporter;
 pub mod exporters;
 pub mod go_to_line;
+pub mod hex_file_picker;
 pub mod histogram_builder;
 pub mod importer;
 pub mod importers;

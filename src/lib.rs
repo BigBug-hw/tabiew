@@ -30,4 +30,7 @@ pub mod writers;
 
 pub mod ctl;
 
+/// Raw binary / Parquet structure inspection (hex viewer backing logic).
+pub mod binary;
+
 pub type AppResult<T> = anyhow::Result<T>;

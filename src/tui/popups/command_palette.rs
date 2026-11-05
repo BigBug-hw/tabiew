@@ -91,6 +91,7 @@ impl Component for CommandPalette {
                             Command::FuzzySearch => Message::PaneShowFuzzySearch.enqueue(),
                             Command::Search => Message::PaneShowSearch.enqueue(),
                             Command::Edit => Message::PaneEditInExternalEditor.enqueue(),
+                            Command::HexViewer => Message::AppShowHexViewer(None).enqueue(),
                             Command::ReloadConfig => Message::AppReloadConfig.enqueue(),
                         }
                     }
@@ -115,6 +116,7 @@ enum Command {
     Filter,
     FloatingPointPrecision,
     FuzzySearch,
+    HexViewer,
     Histogram,
     Import,
     Info,
@@ -149,6 +151,7 @@ impl Command {
             Command::Filter => icons::FILTER,
             Command::FloatingPointPrecision => icons::PRECISION,
             Command::FuzzySearch => icons::FUZZY_SEARCH,
+            Command::HexViewer => icons::HEX,
             Command::Histogram => icons::CHART,
             Command::Import => icons::IMPORT,
             Command::Info => icons::INFO,

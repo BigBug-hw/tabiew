@@ -1,0 +1,49 @@
+version: 1
+profile: industrial
+structure: codespec-dir
+workflowSuite: default
+workflowPack: codespec
+paths:
+  docs: codespec
+  specs: codespec/specs
+  changes: codespec/changes
+  archives: codespec/changes/archives
+  runtime: .codespec-cli
+templates:
+  preset: company-default
+  language: zh-CN
+change:
+  id_prefix: AR
+  naming: '{id}-{slug}'
+  single_active_change: false
+validation:
+  require_validation_doc: true
+  require_service_context: false
+  fail_on_missing_required_sections: true
+integrations:
+  default: generic
+  enabled:
+    - generic
+sync:
+  provider: none
+generation:
+  runner: opencode
+  supported_runners:
+    - opencode
+    - opencode-serve
+    - relay-serve
+    - relay-pool
+    - chrys
+    - codegenie
+    - codeagent
+    - nga
+    - deveco
+  mode: module-first
+  apply_requires_force_on_existing: true
+implementation:
+  tddMode: false
+codewiki:
+  auth: yunlong-codewiki
+  auth_help: 执行 codespec auth login，通过浏览器完成云龙登录
+extensions: {}
+activeAgent: codeagent

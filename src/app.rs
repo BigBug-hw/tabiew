@@ -3,8 +3,10 @@ use std::sync::Arc;
 use crate::misc::config::config;
 use crate::net::remote_load::{self, RemoteLoad};
 use crate::tui::Pane;
+use crate::tui::hex_viewer::HexViewer;
 use crate::tui::layouts::notification::NotificationLayout;
 use crate::tui::popups::download_notif::DownloadNotification;
+use crate::tui::popups::hex_file_picker::HexFilePicker;
 use crate::tui::popups::pickers::sql_query_picker::SqlQueryPicker;
 use crate::tui::table::Table;
 use crate::tui::toast::Toast;
@@ -38,6 +40,7 @@ pub struct App {
     tabs: Tabs,
     overlay: Option<Overlay>,
     schema: Option<Schema>,
+    hex_viewer: Option<HexViewer>,
     toast: Option<Toast>,
     dls: Vec<DownloadNotification>,
     running: bool,
@@ -53,10 +56,17 @@ impl App {
             tabs,
             overlay: None,
             schema: None,
+            hex_viewer: None,
             toast: None,
             running: true,
             dls: Vec::new(),
         }
+    }
+
+    /// Builder-style setter used by `main.rs` to inject a `--hex` viewer.
+    pub fn with_hex_viewer(mut self, viewer: Option<HexViewer>) -> Self {
+        self.hex_viewer = viewer;
+        self
     }
 
     pub fn running(&self) -> bool {
@@ -178,6 +188,30 @@ impl App {
         self.schema = None;
     }
 
+    /// `Some(path)` opens the hex viewer for that file and dismisses any
+    /// overlay; `None` opens the file picker overlay instead.
+    fn show_hex_viewer(&mut self, path: Option<std::path::PathBuf>) {
+        if let Some(p) = path {
+            match HexViewer::open_path(&p) {
+                Ok(v) => {
+                    self.hex_viewer = Some(v);
+                    self.overlay = None;
+                }
+                Err(e) => self.show_error(e.to_string()),
+            }
+        } else {
+            self.overlay = Some(Overlay::HexFilePicker(HexFilePicker::default()));
+        }
+    }
+
+    fn dismiss_hex_viewer(&mut self) {
+        self.hex_viewer = None;
+        // If there are no tabs to return to, quit rather than show a blank screen.
+        if self.tabs.is_empty() {
+            self.quit();
+        }
+    }
+
     fn quit(&mut self) {
         self.running = false;
     }
@@ -190,21 +224,24 @@ impl Component for App {
         buf: &mut ratatui::prelude::Buffer,
         _: crate::tui::component::FocusState,
     ) {
-        match (self.overlay.as_mut(), self.schema.as_mut()) {
-            (Some(overlay), Some(schema)) => {
-                schema.render(area, buf, FocusState::NotFocused);
-                overlay.responder().render(area, buf, FocusState::Focused);
-            }
-            (Some(overlay), None) => {
-                self.tabs.render(area, buf, FocusState::NotFocused);
-                overlay.responder().render(area, buf, FocusState::Focused);
-            }
-            (None, Some(schema)) => {
-                schema.render(area, buf, FocusState::Focused);
-            }
-            (None, None) => {
-                self.tabs.render(area, buf, FocusState::Focused);
-            }
+        // Sequential if/else base layer: hex_viewer has highest priority,
+        // then schema, then tabs. The overlay (if any) is rendered on top
+        // with focus. This preserves the previous (overlay, schema) tuple
+        // semantics while avoiding a simultaneous borrow of `self`.
+        let base_focus = if self.overlay.is_some() {
+            FocusState::NotFocused
+        } else {
+            FocusState::Focused
+        };
+        if let Some(v) = self.hex_viewer.as_mut() {
+            v.render(area, buf, base_focus);
+        } else if let Some(s) = self.schema.as_mut() {
+            s.render(area, buf, base_focus);
+        } else {
+            self.tabs.render(area, buf, base_focus);
+        }
+        if let Some(o) = self.overlay.as_mut() {
+            o.responder().render(area, buf, FocusState::Focused);
         }
 
         let areas = Layout::new(
@@ -227,6 +264,8 @@ impl Component for App {
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.responder().handle(event);
             true
+        } else if let Some(hex) = self.hex_viewer.as_mut() {
+            hex.handle(event)
         } else {
             (if let Some(schema) = self.schema.as_mut() {
                 schema.handle(event)
@@ -259,6 +298,8 @@ impl Component for App {
             Message::AppShowThemeSelector => self.show_theme_selector(),
             Message::AppShowFpPrecisionPicker => self.show_fp_precision_picker(),
             Message::AppShowSchema => self.show_schema(),
+            Message::AppShowHexViewer(path) => self.show_hex_viewer(path.clone()),
+            Message::AppDismissHexViewer => self.dismiss_hex_viewer(),
             Message::AppShowImporter => self.show_importer(),
             Message::AppShowArrowImporter => self.show_arrow_importer(),
             Message::AppShowAvroImporter => self.show_avro_importer(),
@@ -282,6 +323,9 @@ impl Component for App {
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.responder().update(action);
         }
+        if let Some(hex) = self.hex_viewer.as_mut() {
+            hex.update(action);
+        }
         if let Some(schema) = self.schema.as_mut() {
             schema.update(action);
         }
@@ -291,6 +335,9 @@ impl Component for App {
     fn tick(&mut self) {
         if let Some(overlay) = self.overlay.as_mut() {
             overlay.responder().tick();
+        }
+        if let Some(hex) = self.hex_viewer.as_mut() {
+            hex.tick();
         }
         if let Some(toast) = self.toast.as_mut()
             && toast.is_finished()
@@ -326,6 +373,7 @@ pub enum Overlay {
     CommandPicker(CommandPalette),
     ThemeSelector(ThemeSelector),
     FpPrecisionPicker(FpPrecisionPicker),
+    HexFilePicker(HexFilePicker),
     SqlQueryPicker(SqlQueryPicker),
     Import(Importer),
     ImportArrow(ArrowImporter),
@@ -351,6 +399,7 @@ impl Overlay {
             Overlay::CommandPicker(command_palette) => command_palette,
             Overlay::ThemeSelector(theme_selector) => theme_selector,
             Overlay::FpPrecisionPicker(fp_precision_picker) => fp_precision_picker,
+            Overlay::HexFilePicker(hex_file_picker) => hex_file_picker,
             Overlay::Import(step_by_step) => step_by_step,
             Overlay::SqlQueryPicker(sql_query_picker) => sql_query_picker,
             Overlay::ImportArrow(importer) => importer,

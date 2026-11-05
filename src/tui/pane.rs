@@ -158,6 +158,41 @@ impl Pane {
         }
     }
 
+    /// Open the hex viewer for the pane's original backing file, if any.
+    /// Uses `dstack.base()` (not `last()`) so derived views (Query/Filter/…)
+    /// still resolve back to the file they came from.
+    fn show_hex_viewer(&mut self) {
+        match self.dstack.base() {
+            TableDescription::Table(name) => {
+                match sql().schema().get(name).map(|info| info.source()).cloned() {
+                    Some(TableSource::File(path)) => {
+                        Message::AppShowHexViewer(Some(path)).enqueue();
+                    }
+                    Some(TableSource::Url(_))
+                    | Some(TableSource::Stdin)
+                    | Some(TableSource::User)
+                    | None => {
+                        Message::AppShowToast("Hex view is only available for local files".into())
+                            .enqueue();
+                    }
+                }
+            }
+            // Base description should always be `Table` for real panes; the
+            // derived variants only appear pushed on top. Handle exhaustively
+            // for safety.
+            TableDescription::Query(_)
+            | TableDescription::Filter(_)
+            | TableDescription::Order(_)
+            | TableDescription::Select(_)
+            | TableDescription::Cast(_)
+            | TableDescription::Search(_)
+            | TableDescription::FuzzySearch(_) => {
+                Message::AppShowToast("Hex view is only available for local files".into())
+                    .enqueue();
+            }
+        }
+    }
+
     fn show_scatter_plot(
         &mut self,
         x_label: &str,
@@ -450,6 +485,10 @@ impl Component for Pane {
                     }
                     (KeyCode::Char('i'), KeyModifiers::NONE) => {
                         self.show_data_frame_info();
+                        true
+                    }
+                    (KeyCode::Char('x'), KeyModifiers::NONE) => {
+                        self.show_hex_viewer();
                         true
                     }
                     (KeyCode::Char('/'), KeyModifiers::NONE) => {

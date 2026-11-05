@@ -1,6 +1,7 @@
 pub mod app_default;
 pub mod component;
 pub mod error_popup;
+pub mod hex_viewer;
 pub mod icons;
 pub mod layouts;
 pub mod misc;

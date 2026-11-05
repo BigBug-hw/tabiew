@@ -27,6 +27,7 @@ use tabiew::readers::{
     MarkdownToDataFrame, NamedFrames, ParquetToDataFrame, SqliteToDataFrames,
 };
 use tabiew::tui::component::Component;
+use tabiew::tui::hex_viewer::HexViewer;
 use tabiew::tui::pane::TableDescription;
 use tabiew::tui::tabs::Tabs;
 use tabiew::tui::terminal::{draw, start_tui, stop_tui};
@@ -53,6 +54,16 @@ fn main() {
     }
 
     config::init().unwrap_or_graceful_shutdown();
+
+    // --hex: skip DataFrame loading entirely and open the hex viewer instead.
+    if args.hex {
+        let hex_viewer = build_hex_viewer(&args).unwrap_or_graceful_shutdown();
+        start_tui().unwrap_or_graceful_shutdown();
+        start_app(hex_viewer).unwrap_or_graceful_shutdown();
+        let _ = stop_tui();
+        shutdown_shared_ipc_channel();
+        return;
+    }
 
     let parser = DataFrameParser::from_env_args();
 
@@ -97,7 +108,7 @@ fn main() {
     }
 
     start_tui().unwrap_or_graceful_shutdown();
-    start_app().unwrap_or_graceful_shutdown();
+    start_app(None).unwrap_or_graceful_shutdown();
     let _ = stop_tui();
     shutdown_shared_ipc_channel();
 }
@@ -138,7 +149,7 @@ fn print_json(value: &impl serde::Serialize) -> AppResult<()> {
     Ok(())
 }
 
-fn start_app() -> AppResult<()> {
+fn start_app(hex_viewer: Option<HexViewer>) -> AppResult<()> {
     let names = sql()
         .schema()
         .iter()
@@ -159,7 +170,7 @@ fn start_app() -> AppResult<()> {
     let tabs = Tabs::new(panes);
 
     // Initialize the app
-    let mut app = App::new(tabs);
+    let mut app = App::new(tabs).with_hex_viewer(hex_viewer);
 
     // Main loop
     while app.running() {
@@ -225,6 +236,37 @@ fn try_read_path(args: &Args, source: &DataSource) -> AppResult<NamedFrames> {
             build_reader(args, file.path())?
                 .read_to_data_frames(ReaderSource::File(file.path().to_owned()))
         }
+    }
+}
+
+/// Resolve the `--hex` source into a [`HexViewer`].
+///
+/// - `tw --hex path/to/file` → open that file.
+/// - `tw --hex -` or piped stdin with no sources → read stdin bytes.
+/// - `tw --hex` (no sources, stdin is a TTY) → `None`, which makes `App`
+///   open the `HexFilePicker` overlay so the user can choose a file.
+/// - `tw --hex http://…` → error (URL download lifetime is not supported
+///   in the hex path yet).
+fn build_hex_viewer(args: &Args) -> AppResult<Option<HexViewer>> {
+    if let Some(first) = args.sources.first() {
+        let resource = DataSource::from_str(first)?;
+        match resource {
+            DataSource::File(path) => Ok(Some(HexViewer::open_path(&path)?)),
+            DataSource::Stdin => {
+                let bytes = tabiew::misc::stdin::stdin().into_inner().to_vec();
+                Ok(Some(HexViewer::from_bytes("Stdin", bytes)))
+            }
+            DataSource::Url(_) => Err(anyhow::anyhow!(
+                "Hex view over URLs is not supported yet; download the file first."
+            )),
+        }
+    } else if !std::io::stdin().is_terminal() {
+        // Piped stdin, no explicit source: treat like `-`.
+        let bytes = tabiew::misc::stdin::stdin().into_inner().to_vec();
+        Ok(Some(HexViewer::from_bytes("Stdin", bytes)))
+    } else {
+        // TTY, no source: let the app open the file picker.
+        Ok(None)
     }
 }
 
