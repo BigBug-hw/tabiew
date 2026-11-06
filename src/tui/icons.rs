@@ -84,6 +84,7 @@ pub const TRASH: Icon = Icon("\u{F1F8} ");
 pub const WEDGE: Icon = Icon("\u{E0B0}");
 pub const TAB: Icon = Icon("\u{F04E9} ");
 pub const REMOTE: Icon = Icon("\u{F0454} ");
+pub const HEX: Icon = Icon("\u{F0FD} ");
 
 pub fn extension(ext: Option<&str>) -> Icon {
     match ext {

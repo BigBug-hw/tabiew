@@ -7,6 +7,7 @@ use polars::frame::DataFrame;
 use url::Url;
 
 use crate::{AppResult, net::remote_load::Reader, tui::pane::TableDescription};
+use std::path::PathBuf;
 
 static SHARED_CHANNEL: LazyLock<(Sender<Message>, Mutex<Receiver<Message>>)> =
     LazyLock::new(|| {
@@ -24,6 +25,8 @@ pub enum Message {
     AppShowThemeSelector,
     AppShowFpPrecisionPicker,
     AppShowSchema,
+    AppShowHexViewer(Option<PathBuf>),
+    AppDismissHexViewer,
     AppShowImporter,
     AppShowArrowImporter,
     AppShowAvroImporter,
