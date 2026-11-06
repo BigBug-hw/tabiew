@@ -19,7 +19,7 @@ use crate::{
     AppResult,
     binary::{
         hex::{BYTES_PER_ROW, Cursor, format_ascii, format_byte, format_offset, rows},
-        parquet::{ParquetLayout, Region, RegionKind, parse},
+        layout::{FileLayout, UnifiedRegion, dispatch},
         source::ByteSource,
     },
     handler::message::Message,
@@ -42,7 +42,9 @@ enum Focus {
 pub struct HexViewer {
     name: String,
     source: ByteSource,
-    layout: ParquetLayout,
+    layout: FileLayout,
+    /// Cached format-agnostic regions (computed once from `layout`).
+    regions: Vec<UnifiedRegion>,
     cursor: Cursor,
     /// First visible absolute offset.
     scroll: u64,
@@ -78,13 +80,15 @@ impl HexViewer {
         // windowed. We cap parquet parsing at 256 MiB to avoid OOM on giant
         // non-parquet blobs (the parser will reject them quickly anyway).
         let bytes = source.read_range(0, source.len() as usize)?;
-        let layout = parse(&bytes);
+        let layout = dispatch(&bytes);
         let len = source.len();
+        let regions = layout.unified_regions();
         let collapsed = default_collapsed(&layout);
         Ok(Self {
             name,
             source,
             layout,
+            regions,
             cursor: Cursor::new(len),
             scroll: 0,
             visible_rows: 0,
@@ -101,13 +105,15 @@ impl HexViewer {
     /// Build a viewer from an in-memory buffer (stdin / tests).
     pub fn from_bytes(name: impl Into<String>, data: Vec<u8>) -> Self {
         let len = data.len() as u64;
-        let layout = parse(&data);
+        let layout = dispatch(&data);
         let source = ByteSource::from_bytes(data);
+        let regions = layout.unified_regions();
         let collapsed = default_collapsed(&layout);
         Self {
             name: name.into(),
             source,
             layout,
+            regions,
             cursor: Cursor::new(len),
             scroll: 0,
             visible_rows: 0,
@@ -126,11 +132,11 @@ impl HexViewer {
     }
 
     /// Find the **innermost** region containing `offset`, if any.
-    /// Regions are nested (RowGroup ⊃ ColumnChunk ⊃ PageHeader/PageData),
-    /// so we pick the one with the smallest span — that's the leaf.
-    fn region_at(&self, offset: u64) -> Option<&Region> {
-        self.layout
-            .regions
+    /// Regions are nested (e.g. RowGroup ⊃ ColumnChunk ⊃ PageHeader/PageData
+    /// for Parquet, or Manifest ⊃ ManifestField for Lance), so we pick the one
+    /// with the smallest span — that's the leaf.
+    fn region_at(&self, offset: u64) -> Option<&UnifiedRegion> {
+        self.regions
             .iter()
             .filter(|r| offset >= r.span.start && offset < r.span.end)
             .min_by_key(|r| r.span.end - r.span.start)
@@ -160,10 +166,10 @@ impl HexViewer {
     /// annotated with `depth`; a collapsed node at depth D hides all
     /// following nodes with depth > D until depth returns to <= D.
     fn visible_tree_indices(&self) -> Vec<usize> {
-        let mut out = Vec::with_capacity(self.layout.tree.len());
+        let mut out = Vec::with_capacity(self.layout.tree().len());
         // Stack of (raw_index, depth) for currently-collapsed ancestors.
         let mut collapsed_stack: Vec<(usize, u8)> = Vec::new();
-        for (i, n) in self.layout.tree.iter().enumerate() {
+        for (i, n) in self.layout.tree().iter().enumerate() {
             // Pop collapsed ancestors whose depth >= current depth (they no
             // longer cover this node).
             while let Some(&(_, d)) = collapsed_stack.last() {
@@ -221,7 +227,7 @@ impl HexViewer {
     /// Ensure tree node `idx` is visible by expanding all ancestors that
     /// contain it and are currently collapsed.
     fn ensure_node_visible(&mut self, idx: usize) {
-        let target = match self.layout.tree.get(idx) {
+        let target = match self.layout.tree().get(idx) {
             Some(n) => n,
             None => return,
         };
@@ -231,7 +237,7 @@ impl HexViewer {
         // span (larger span). Expand any that are collapsed.
         let to_expand: Vec<usize> = self
             .layout
-            .tree
+            .tree()
             .iter()
             .enumerate()
             .filter(|(i, n)| {
@@ -320,7 +326,7 @@ impl Component for HexViewer {
                     Focus::Hex => {
                         if let Some(idx) = self
                             .layout
-                            .tree
+                            .tree()
                             .iter()
                             .enumerate()
                             .filter(|(_, n)| {
@@ -335,7 +341,7 @@ impl Component for HexViewer {
                         self.focus = Focus::Tree;
                     }
                     Focus::Tree => {
-                        if let Some(n) = self.layout.tree.get(self.tree_sel) {
+                        if let Some(n) = self.layout.tree().get(self.tree_sel) {
                             self.jump_to(n.span.start);
                         }
                         self.focus = Focus::Hex;
@@ -434,7 +440,6 @@ impl HexViewer {
             }
             (KeyCode::Char('['), KeyModifiers::NONE) => {
                 if let Some(start) = self
-                    .layout
                     .regions
                     .iter()
                     .rev()
@@ -448,7 +453,6 @@ impl HexViewer {
             }
             (KeyCode::Char(']'), KeyModifiers::NONE) => {
                 if let Some(start) = self
-                    .layout
                     .regions
                     .iter()
                     .filter(|r| r.span.start > self.cursor.pos)
@@ -465,7 +469,7 @@ impl HexViewer {
                 // e.g. PageData instead of RowGroup).
                 if let Some(idx) = self
                     .layout
-                    .tree
+                    .tree()
                     .iter()
                     .enumerate()
                     .filter(|(_, n)| {
@@ -539,7 +543,7 @@ impl HexViewer {
                     self.collapsed.remove(&self.tree_sel);
                 } else if self
                     .layout
-                    .tree
+                    .tree()
                     .get(self.tree_sel)
                     .map(|n| n.collapsible)
                     .unwrap_or(false)
@@ -550,7 +554,7 @@ impl HexViewer {
             }
             (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
                 // Jump hex cursor to the selected node's span start.
-                if let Some(n) = self.layout.tree.get(self.tree_sel) {
+                if let Some(n) = self.layout.tree().get(self.tree_sel) {
                     self.jump_to(n.span.start);
                     self.focus = Focus::Hex;
                 }
@@ -620,8 +624,8 @@ impl HexViewer {
                 let s = format!("{}{}", sep, format_byte(*b));
                 if abs == self.cursor.pos {
                     spans.push(Span::styled(s, hl_style));
-                } else if self.layout.is_parquet {
-                    let style = byte_style(abs, cursor_region, &self.layout, text_style);
+                } else if self.layout.is_recognized() {
+                    let style = byte_style(abs, cursor_region, &self.regions, text_style);
                     spans.push(Span::styled(s, style));
                 } else {
                     spans.push(Span::styled(s, text_style));
@@ -639,8 +643,8 @@ impl HexViewer {
                 let c = format_ascii(*b);
                 if abs == self.cursor.pos {
                     spans.push(Span::styled(c.to_string(), hl_style));
-                } else if self.layout.is_parquet {
-                    let style = byte_style(abs, cursor_region, &self.layout, text_style);
+                } else if self.layout.is_recognized() {
+                    let style = byte_style(abs, cursor_region, &self.regions, text_style);
                     spans.push(Span::styled(c.to_string(), style));
                 } else {
                     spans.push(Span::styled(c.to_string(), text_style));
@@ -718,11 +722,11 @@ impl HexViewer {
             }
         }
 
-        if self.layout.is_parquet {
+        if self.layout.is_recognized() {
             if let Some(r) = self.region_at(self.cursor.pos) {
                 lines.push(Line::from(vec![
                     Span::styled("region : ", sub_style),
-                    Span::styled(region_kind_name(r.kind), text_style),
+                    Span::styled(r.kind_name, text_style),
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("label  : ", sub_style),
@@ -741,15 +745,15 @@ impl HexViewer {
                     Span::styled("— (no structure here)", sub_style),
                 ]));
             }
-        } else if let Some(err) = &self.layout.error {
+        } else if let Some(err) = self.layout.error() {
             lines.push(Line::from(vec![
                 Span::styled("note   : ", sub_style),
-                Span::styled(err.clone(), sub_style),
+                Span::styled(err.to_string(), sub_style),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::styled("note   : ", sub_style),
-                Span::styled("Not a Parquet file", sub_style),
+                Span::styled("Not a recognized format", sub_style),
             ]));
         }
 
@@ -760,7 +764,7 @@ impl HexViewer {
     }
 
     fn render_tree(&mut self, area: Rect, buf: &mut ratatui::prelude::Buffer) {
-        let title = if self.layout.is_parquet {
+        let title = if self.layout.is_recognized() {
             " Structure "
         } else {
             " Structure (none) "
@@ -777,10 +781,10 @@ impl HexViewer {
         let sub_style = theme().subtext();
         let sel_style = theme().row_highlighted();
 
-        if !self.layout.is_parquet {
-            let msg = match &self.layout.error {
-                Some(e) => format!("Not a Parquet file:\n{e}"),
-                None => "Not a Parquet file".to_string(),
+        if !self.layout.is_recognized() {
+            let msg = match self.layout.error() {
+                Some(e) => format!("Not a recognized format:\n{e}"),
+                None => "Not a recognized format".to_string(),
             };
             Paragraph::new(msg)
                 .style(sub_style)
@@ -815,7 +819,7 @@ impl HexViewer {
 
         let mut lines: Vec<Line> = Vec::with_capacity(end - start);
         for &i in visible[start..end].iter() {
-            let n = &self.layout.tree[i];
+            let n = &self.layout.tree()[i];
             let indent = "  ".repeat(n.depth as usize);
             let marker = if n.collapsible {
                 if self.collapsed.contains(&i) {
@@ -838,94 +842,55 @@ impl HexViewer {
     }
 }
 
-fn region_kind_name(k: RegionKind) -> &'static str {
-    match k {
-        RegionKind::Magic => "Magic",
-        RegionKind::FooterLength => "FooterLength",
-        RegionKind::Metadata => "FileMetaData",
-        RegionKind::MetaField => "MetaField",
-        RegionKind::RowGroup => "RowGroup",
-        RegionKind::ColumnChunk => "ColumnChunk",
-        RegionKind::PageHeader => "PageHeader",
-        RegionKind::PageData => "PageData",
-        RegionKind::Unknown => "Unknown",
-    }
-}
-
 /// Compute the set of tree node indices that should be collapsed by default.
-/// PageHeader nodes and the schema list are collapsed to keep the initial
-/// view focused on the high-level structure (regions, column chunks, pages)
-/// rather than the verbose Thrift field details.
-fn default_collapsed(layout: &ParquetLayout) -> std::collections::HashSet<usize> {
+/// For Parquet, PageHeader nodes and the schema list are collapsed to keep the
+/// initial view focused on the high-level structure. For Lance, the verbose
+/// ColumnEncoding/ArrayEncoding protobuf subtrees are collapsed.
+fn default_collapsed(layout: &FileLayout) -> std::collections::HashSet<usize> {
     let mut set = std::collections::HashSet::new();
-    for (i, n) in layout.tree.iter().enumerate() {
+    let tree = layout.tree();
+    for (i, n) in tree.iter().enumerate() {
         if !n.collapsible {
             continue;
         }
+        // Parquet: collapse page headers and the schema list.
         if n.label.starts_with("PageHeader ") || n.label.starts_with("schema[") {
+            set.insert(i);
+        }
+        // Lance: collapse the protobuf column-metadata subtrees.
+        // ColumnMetadata[N] (depth 1) and Page[N] nodes contain nested
+        // ColumnEncoding/ArrayEncoding fields. Also collapse the "Column
+        // Metadatas" parent and the encoding subtrees.
+        if n.label.starts_with("ColumnMetadata[")
+            || n.label.starts_with("Page[")
+            || n.label.starts_with("Column Metadatas")
+            || n.label.starts_with("encoding (")
+            || n.label.starts_with("direct (DirectEncoding)")
+        {
             set.insert(i);
         }
     }
     set
 }
 
-/// Map each region kind to a stable color from the theme's accent palette
-/// (`graph(idx)` cycles through `DARK_COLORS`). Bytes inside a region get
-/// this foreground color so different Parquet regions are visually distinct
-/// in the hex dump. `MetaField` regions use the label to pick a color so the
-/// FileMetaData sub-fields (version, schema, num_rows, …) are individually
-/// distinguishable.
-fn region_style(r: &Region) -> Style {
-    let idx = match r.kind {
-        RegionKind::Magic => 0,
-        RegionKind::FooterLength => 1,
-        RegionKind::Metadata => 2,
-        RegionKind::MetaField => {
-            // Map each FileMetaData sub-field to a distinct color by label
-            // prefix. Avoid index 2 (used by the parent Metadata region).
-            let pool = [0usize, 1, 3, 4, 5];
-            let slot = if r.label.starts_with("version") {
-                0
-            } else if r.label.starts_with("schema") {
-                1
-            } else if r.label.starts_with("num_rows") {
-                2
-            } else if r.label.starts_with("row_groups") {
-                3
-            } else if r.label.starts_with("key_value_metadata") {
-                4
-            } else {
-                0
-            };
-            pool[slot % pool.len()]
-        }
-        RegionKind::RowGroup => 3,
-        RegionKind::ColumnChunk => 4,
-        RegionKind::PageHeader => 5,
-        RegionKind::PageData => 0,
-        RegionKind::Unknown => 1,
-    };
-    theme().graph(idx)
-}
-
-/// Pick a style for a byte at `abs` based on which region it falls in.
+/// Pick a style for a byte at `abs` based on which unified region it falls in.
 /// Bytes in the cursor's current region are rendered bold (brighter) so the
-/// active region stands out from other same-colored regions.
+/// active region stands out from other same-colored regions. Color indices
+/// come precomputed in each `UnifiedRegion` (see `Layout::unified_regions`).
 fn byte_style(
     abs: u64,
-    cursor_region: Option<&Region>,
-    layout: &ParquetLayout,
+    cursor_region: Option<&UnifiedRegion>,
+    regions: &[UnifiedRegion],
     default_style: Style,
 ) -> Style {
-    let Some(r) = layout
-        .regions
+    let Some(r) = regions
         .iter()
         .filter(|r| abs >= r.span.start && abs < r.span.end)
         .min_by_key(|r| r.span.end - r.span.start)
     else {
         return default_style;
     };
-    let mut s = region_style(r);
+    let mut s = theme().graph(r.color_idx);
     if let Some(cr) = cursor_region
         && cr.span.start == r.span.start
         && cr.span.end == r.span.end

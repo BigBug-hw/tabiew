@@ -28,6 +28,9 @@
 .codespec-cli/tmp/
 .codespec-cli/runtime-commands/
 .codespec-cli/report-queue/
+.codespec-cli/
 .codecheckcli/
+codespec/
+example/
 /reports/codecheck.*
 /reports/archive/codecheck.*
