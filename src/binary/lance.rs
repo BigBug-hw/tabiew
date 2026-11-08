@@ -591,7 +591,30 @@ fn sort_roots(tree: &mut Vec<MetaNode>) {
         roots.last_mut().unwrap().push(n);
     }
     roots.sort_by_key(|r| r[0].span.start);
-    *tree = roots.into_iter().flatten().collect();
+    let mut grouped: Vec<MetaNode> = Vec::new();
+    let mut parent = None;
+    for mut subtree in roots {
+        if subtree[0].label.starts_with("ColumnMetadata[") {
+            let index = *parent.get_or_insert_with(|| {
+                let index = grouped.len();
+                grouped.push(MetaNode {
+                    depth: 0,
+                    label: "Column Metadata Table".into(),
+                    span: subtree[0].span.clone(),
+                    collapsible: true,
+                });
+                index
+            });
+            grouped[index].span.end = grouped[index].span.end.max(subtree[0].span.end);
+            for node in &mut subtree {
+                node.depth += 1;
+            }
+        } else {
+            parent = None;
+        }
+        grouped.extend(subtree);
+    }
+    *tree = grouped;
 }
 fn preview_bytes(b: &[u8]) -> String {
     let s = b
@@ -1061,6 +1084,29 @@ mod tests {
             l.regions
                 .iter()
                 .any(|r| r.kind == RegionKind::DataBuffer && r.span == (64..72))
+        );
+    }
+    #[test]
+    fn column_metadata_group_preserves_regions() {
+        let layout = parse(include_bytes!("../../tests/fixtures/dentry.lance"));
+        let parent = layout
+            .tree
+            .iter()
+            .find(|n| n.label == "Column Metadata Table")
+            .unwrap();
+        assert_eq!(parent.span, 356..691);
+        let children: Vec<_> = layout
+            .tree
+            .iter()
+            .filter(|n| n.label.starts_with("ColumnMetadata["))
+            .collect();
+        assert_eq!(children.len(), 3);
+        assert!(children.iter().all(|n| n.depth == 1));
+        assert!(
+            !layout
+                .regions
+                .iter()
+                .any(|r| r.label == "Column Metadata Table")
         );
     }
 }

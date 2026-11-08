@@ -919,37 +919,15 @@ impl HexViewer {
     }
 }
 
-/// Compute the set of tree node indices that should be collapsed by default.
-/// For Parquet, PageHeader nodes and the schema list are collapsed to keep the
-/// initial view focused on the high-level structure. For Lance, the verbose
-/// ColumnEncoding/ArrayEncoding protobuf subtrees are collapsed.
+/// Initially expose roots and direct children; deeper containers open on demand.
 fn default_collapsed(layout: &FileLayout) -> std::collections::HashSet<usize> {
-    let mut set = std::collections::HashSet::new();
-    let tree = layout.tree();
-    for (i, n) in tree.iter().enumerate() {
-        if !n.collapsible {
-            continue;
-        }
-        // Parquet: collapse page headers and the schema list.
-        if n.label.starts_with("PageHeader ") || n.label.starts_with("schema[") {
-            set.insert(i);
-        }
-        // Lance: collapse the protobuf column-metadata subtrees.
-        // ColumnMetadata[N] (depth 1) and Page[N] nodes contain nested
-        // ColumnEncoding/ArrayEncoding fields. Also collapse the "Column
-        // Metadatas" parent and the encoding subtrees.
-        if n.label.starts_with("ColumnMetadata[")
-            || n.label.starts_with("Page[")
-            || (layout.format() == crate::binary::layout::Format::Lance
-                && n.label.starts_with("pages["))
-            || n.label.starts_with("Column Metadatas")
-            || n.label.starts_with("encoding (")
-            || n.label.starts_with("direct (DirectEncoding)")
-        {
-            set.insert(i);
-        }
-    }
-    set
+    layout
+        .tree()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.collapsible && node.depth >= 1)
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// Pick a style for a byte at `abs` based on which unified region it falls in.
@@ -1533,5 +1511,21 @@ mod tests {
         viewer.open_detail();
         assert!(viewer.detail.is_some());
         assert!(viewer.detail.as_ref().unwrap().page.is_none());
+    }
+    #[test]
+    fn initial_trees_only_expose_two_levels() {
+        for bytes in [
+            include_bytes!("../../tests/fixtures/dentry.lance").as_slice(),
+            include_bytes!("../../tests/fixtures/sample-nested.parquet").as_slice(),
+        ] {
+            let viewer = HexViewer::from_bytes("fixture", bytes.to_vec());
+            assert!(
+                viewer
+                    .visible_tree_indices()
+                    .iter()
+                    .all(|i| viewer.layout.tree()[*i].depth <= 1)
+            );
+            assert!(viewer.layout.tree().iter().any(|n| n.depth > 1));
+        }
     }
 }
