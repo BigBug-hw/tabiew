@@ -158,11 +158,24 @@ curl -s "https://raw.githubusercontent.com/wiki/shshemi/tabiew/housing.csv" | tw
 
 ### Hex viewer
 
-Open any file as raw bytes with `--hex`. For Parquet files the viewer also
-parses the on-disk structure — `PAR1` magic, footer length, the Thrift
-`FileMetaData`, schema, row groups, column chunks, and page headers — and maps
-each region back to its byte range, which is useful for learning how Parquet
-works.
+Open any file as raw bytes with `--hex`. Parquet files additionally show their
+physical layout: magic, row groups, column chunks, pages, indexes, Bloom filters,
+and the Thrift footer. Metadata fields use the official Parquet names and map to
+their actual encoded byte ranges. Offsets are hexadecimal and ranges are
+`[start, end)`; unknown gaps remain explicitly unidentified.
+
+Press `f` to follow an offset reference (or return from data to its metadata),
+and `Alt-Left` to return to the previous location. Press `d` on a page to inspect
+its decompressed hex, encoding controls, levels, dictionary indices, and decoded
+values. `Tab` switches detail tabs; `Esc` returns without changing the original
+selection. Arrow keys scroll details; left/right scroll long field values.
+Decompressed offsets are **page-relative**, not offsets into the source file;
+compressed values cannot be mapped to individual source bytes.
+
+Page details are decoded on demand, with a 64 MiB decompressed-page limit and a
+128 MiB detail cache. Unsupported encodings and damaged pages show diagnostics
+while preserving raw inspection. Files over 256 MiB remain available as windowed
+raw hex; their structure is not loaded into memory.
 
 ```bash
 # Open a parquet file and inspect its byte layout / structure
@@ -218,7 +231,10 @@ You can also open the hex viewer from inside Tabiew:
 | `Tab`| Switch focus between the hex pane and the structure tree |
 | `Enter`| In hex: select the region under the cursor in the tree · In tree: collapse/expand the node |
 | `Ctrl + g`| Jump to offset (decimal or `0x…`) |
-| `q` / `Esc`| Close the hex viewer |
+| `f`| Follow metadata/data reference |
+| `Alt-Left`| Return from reference jump |
+| `d`| Open page or field details |
+| `q` / `Esc`| Close details, or close the hex viewer |
 
 ## Useful Commands
 

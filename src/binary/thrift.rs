@@ -106,12 +106,12 @@ impl WireValue {
     }
 }
 
-/// A decoded struct field: `id` plus its value (the span covers the value
-/// only; the field header bytes are tracked separately by the decoder if
-/// needed, but Parquet's field ids are stable so we mostly care about the
-/// value span for "jump to bytes").
+/// A decoded struct field with its ID, full encoding span, and value span.
+/// Boolean field values share their header byte rather than consuming payload bytes.
 #[derive(Debug, Clone)]
 pub struct WireField {
+    /// Full field encoding, including its compact field header.
+    pub span: Range<u64>,
     pub id: i16,
     pub value: WireValue,
 }
@@ -122,6 +122,7 @@ pub struct WireField {
 /// limits. The caller is expected to handle the failure gracefully (e.g. show
 /// an "invalid metadata" message) — we never panic.
 pub fn decode_struct(bytes: &[u8], base: u64) -> Option<Vec<WireField>> {
+    base.checked_add(bytes.len() as u64)?;
     let mut dec = Decoder::new(bytes, base);
     dec.read_struct_body(0).map(|w| match w.kind {
         WireKind::Struct(fields) => fields,
@@ -137,11 +138,12 @@ pub fn decode_struct_span_at(
     base: u64,
     offset: u64,
 ) -> Option<(Vec<WireField>, std::ops::Range<u64>)> {
-    let off = offset as usize;
+    base.checked_add(bytes.len() as u64)?;
+    let off = usize::try_from(offset).ok()?;
     if off > bytes.len() {
         return None;
     }
-    let mut dec = Decoder::new(&bytes[off..], base + offset);
+    let mut dec = Decoder::new(&bytes[off..], base.checked_add(offset)?);
     let w = dec.read_struct_body(0)?;
     Some(match w.kind {
         WireKind::Struct(fields) => (fields, w.span),
@@ -198,6 +200,9 @@ impl<'a> Decoder<'a> {
         let mut shift = 0u32;
         loop {
             let b = self.read_byte()?;
+            if shift == 63 && b > 1 {
+                return None;
+            }
             result |= ((b & 0x7f) as u64) << shift;
             if b & 0x80 == 0 {
                 return Some(result);
@@ -224,6 +229,7 @@ impl<'a> Decoder<'a> {
         let mut fields = Vec::new();
         let mut last_field_id: i16 = 0;
         loop {
+            let field_start = self.pos;
             let header = self.read_byte()?;
             if header == ct::STOP {
                 break;
@@ -231,13 +237,17 @@ impl<'a> Decoder<'a> {
             let wire_type = header & 0x0f;
             let delta = (header >> 4) & 0x0f;
             let field_id = if delta == 0 {
-                self.read_zigzag()? as i16
+                i16::try_from(self.read_zigzag()?).ok()?
             } else {
-                last_field_id.wrapping_add(delta as i16)
+                last_field_id.checked_add(delta as i16)?
             };
             last_field_id = field_id;
-            let value = self.read_value(wire_type)?;
+            let mut value = self.read_value(wire_type)?;
+            if matches!(wire_type, ct::BOOL_TRUE | ct::BOOL_FALSE) {
+                value.span = self.abs(field_start)..self.abs(self.pos);
+            }
             fields.push(WireField {
+                span: self.abs(field_start)..self.abs(self.pos),
                 id: field_id,
                 value,
             });
@@ -249,7 +259,32 @@ impl<'a> Decoder<'a> {
         })
     }
 
+    fn read_collection_value(&mut self, kind: u8) -> Option<WireValue> {
+        if matches!(kind, ct::BOOL_TRUE | ct::BOOL_FALSE) {
+            let start = self.pos;
+            let value = match self.read_byte()? {
+                ct::BOOL_TRUE => true,
+                ct::BOOL_FALSE => false,
+                _ => return None,
+            };
+            return Some(WireValue {
+                span: self.abs(start)..self.abs(self.pos),
+                kind: WireKind::Bool(value),
+            });
+        }
+        self.read_value(kind)
+    }
+
     fn read_value(&mut self, wire_type: u8) -> Option<WireValue> {
+        if self.depth >= MAX_DEPTH {
+            return None;
+        }
+        self.depth += 1;
+        let result = self.read_value_inner(wire_type);
+        self.depth -= 1;
+        result
+    }
+    fn read_value_inner(&mut self, wire_type: u8) -> Option<WireValue> {
         let start = self.pos;
         match wire_type {
             ct::BOOL_TRUE => Some(WireValue {
@@ -321,7 +356,7 @@ impl<'a> Decoder<'a> {
                 }
                 let mut items = Vec::with_capacity(size.min(1024));
                 for _ in 0..size {
-                    items.push(self.read_value(elem_type)?);
+                    items.push(self.read_collection_value(elem_type)?);
                 }
                 Some(WireValue {
                     span: self.abs(start)..self.abs(self.pos),
@@ -333,13 +368,13 @@ impl<'a> Decoder<'a> {
                 if size > MAX_LIST_LEN {
                     return None;
                 }
-                let kv_header = self.read_byte()?;
+                let kv_header = if size == 0 { 0 } else { self.read_byte()? };
                 let _key_type = kv_header >> 4;
                 let val_type = kv_header & 0x0f;
                 let mut entries = Vec::with_capacity(size.min(1024));
                 for _ in 0..size {
-                    let k = self.read_value(kv_header >> 4)?;
-                    let v = self.read_value(val_type)?;
+                    let k = self.read_collection_value(kv_header >> 4)?;
+                    let v = self.read_collection_value(val_type)?;
                     entries.push((k, v));
                 }
                 Some(WireValue {
@@ -476,5 +511,38 @@ mod tests {
             WireKind::Double(v) => assert!((v - 1.0).abs() < f64::EPSILON),
             _ => panic!("expected double"),
         }
+    }
+}
+
+#[cfg(test)]
+mod container_regressions {
+    use super::*;
+    #[test]
+    fn empty_map_preserves_struct_stop() {
+        let fields = decode_struct(&[0x1b, 0, 0], 0).unwrap();
+        assert!(matches!(&fields[0].value.kind, WireKind::Map(entries) if entries.is_empty()));
+        assert_eq!(fields[0].span, 0..2);
+    }
+    #[test]
+    fn boolean_collection_consumes_values() {
+        let fields = decode_struct(&[0x19, 0x21, 1, 2, 0], 0).unwrap();
+        assert_eq!(fields.len(), 1);
+        let values = fields[0].value.as_list().unwrap();
+        assert_eq!(values[0].as_bool(), Some(true));
+        assert_eq!(values[1].as_bool(), Some(false));
+        assert_eq!(values[1].span, 3..4);
+    }
+    #[test]
+    fn boolean_field_includes_header() {
+        let fields = decode_struct(&[0x11, 0], 100).unwrap();
+        assert_eq!(fields[0].span, 100..101);
+        assert_eq!(fields[0].value.span, 100..101);
+    }
+    #[test]
+    fn nested_collections_obey_depth_limit() {
+        let mut bytes = vec![0x19];
+        bytes.extend(std::iter::repeat_n(0x19, 100));
+        bytes.extend_from_slice(&[0x10, 0]);
+        assert!(decode_struct(&bytes, 0).is_none());
     }
 }

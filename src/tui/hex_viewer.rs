@@ -5,7 +5,31 @@
 //! "cursor location" panel (which region/wire field the cursor is in) and a
 //! scrollable structure tree (for Parquet files).
 
-use std::path::PathBuf;
+use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+
+use crate::binary::parquet_decode::{PageDetails, decode_page};
+
+const MAX_STRUCTURE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_DETAIL_CACHE: usize = 128 * 1024 * 1024;
+
+struct DetailView {
+    title: String,
+    field_range: Option<std::ops::Range<u64>>,
+    page: Option<Arc<PageDetails>>,
+    text: Vec<String>,
+    tab: usize,
+    scroll: [usize; 3],
+    horizontal: usize,
+}
+#[derive(Clone)]
+struct NavigationPosition {
+    offset: u64,
+    scroll: u64,
+    tree_sel: usize,
+    tree_scroll: u16,
+    focus: Focus,
+    collapsed: std::collections::HashSet<usize>,
+}
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -63,6 +87,9 @@ pub struct HexViewer {
     error: Option<String>,
     /// Number of tree rows visible in the last render (set in `render`).
     visible_tree_rows: u16,
+    detail: Option<DetailView>,
+    detail_cache: VecDeque<(u64, Arc<PageDetails>, usize)>,
+    history: Vec<NavigationPosition>,
 }
 
 impl HexViewer {
@@ -75,12 +102,16 @@ impl HexViewer {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let mut source = ByteSource::open(&path)?;
-        // Read the whole file for parquet structure parsing. For huge files
-        // this is bounded by available memory; the hex pane itself stays
-        // windowed. We cap parquet parsing at 256 MiB to avoid OOM on giant
-        // non-parquet blobs (the parser will reject them quickly anyway).
-        let bytes = source.read_range(0, source.len() as usize)?;
-        let layout = dispatch(&bytes);
+        let layout = if source.len() > MAX_STRUCTURE_BYTES {
+            FileLayout::Unknown {
+                error: Some(format!(
+                    "Structure parsing skipped: file exceeds {} MiB; raw hex remains available",
+                    MAX_STRUCTURE_BYTES / 1024 / 1024
+                )),
+            }
+        } else {
+            dispatch(&source.read_range(0, source.len() as usize)?)
+        };
         let len = source.len();
         let regions = layout.unified_regions();
         let collapsed = default_collapsed(&layout);
@@ -99,13 +130,25 @@ impl HexViewer {
             goto_input: None,
             error: None,
             visible_tree_rows: 0,
+            detail: None,
+            detail_cache: VecDeque::new(),
+            history: Vec::new(),
         })
     }
 
     /// Build a viewer from an in-memory buffer (stdin / tests).
     pub fn from_bytes(name: impl Into<String>, data: Vec<u8>) -> Self {
         let len = data.len() as u64;
-        let layout = dispatch(&data);
+        let layout = if len > MAX_STRUCTURE_BYTES {
+            FileLayout::Unknown {
+                error: Some(
+                    "Structure parsing skipped: input exceeds 256 MiB; raw hex remains available"
+                        .into(),
+                ),
+            }
+        } else {
+            dispatch(&data)
+        };
         let source = ByteSource::from_bytes(data);
         let regions = layout.unified_regions();
         let collapsed = default_collapsed(&layout);
@@ -124,6 +167,9 @@ impl HexViewer {
             goto_input: None,
             error: None,
             visible_tree_rows: 0,
+            detail: None,
+            detail_cache: VecDeque::new(),
+            history: Vec::new(),
         }
     }
 
@@ -231,26 +277,17 @@ impl HexViewer {
             Some(n) => n,
             None => return,
         };
-        let target_start = target.span.start;
-        let target_end = target.span.end;
-        // A node is an ancestor of `idx` if its span strictly contains `idx`'s
-        // span (larger span). Expand any that are collapsed.
-        let to_expand: Vec<usize> = self
-            .layout
-            .tree()
-            .iter()
-            .enumerate()
-            .filter(|(i, n)| {
-                *i != idx
-                    && n.span.start <= target_start
-                    && n.span.end >= target_end
-                    && (n.span.end - n.span.start) > (target_end - target_start)
-                    && self.collapsed.contains(i)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        for i in to_expand {
-            self.collapsed.remove(&i);
+        let mut depth = target.depth;
+        // Ancestors are defined by tree depth, including equal-span wrappers.
+        for i in (0..idx).rev() {
+            let node = &self.layout.tree()[i];
+            if node.depth < depth {
+                self.collapsed.remove(&i);
+                depth = node.depth;
+            }
+            if depth == 0 {
+                break;
+            }
         }
     }
 }
@@ -265,6 +302,11 @@ impl Component for HexViewer {
         let inner = outer.inner(area);
         outer.render(area, buf);
 
+        if self.detail.is_some() {
+            self.render_detail(inner, buf);
+            return;
+        }
+
         // Two columns: left hex, right info+tree.
         let [left, right] =
             Layout::horizontal([Constraint::Fill(2), Constraint::Fill(3)]).areas(inner);
@@ -276,6 +318,9 @@ impl Component for HexViewer {
     }
 
     fn handle(&mut self, event: KeyEvent) -> bool {
+        if self.detail.is_some() {
+            return self.handle_detail(event);
+        }
         // Ctrl-g input mode takes precedence.
         if let Some(input) = self.goto_input.as_mut() {
             if input.handle(event) {
@@ -304,6 +349,23 @@ impl Component for HexViewer {
             };
         }
 
+        if event.code == KeyCode::Left && event.modifiers == KeyModifiers::ALT {
+            self.return_reference();
+            return true;
+        }
+        if event.modifiers == KeyModifiers::NONE {
+            match event.code {
+                KeyCode::Char('f') => {
+                    self.follow_reference();
+                    return true;
+                }
+                KeyCode::Char('d') => {
+                    self.open_detail();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         let handled = match self.focus {
             Focus::Hex => self.handle_hex(event),
             Focus::Tree => self.handle_tree(event),
@@ -681,7 +743,7 @@ impl HexViewer {
     /// Render the right pane. Returns (top_height, _bottom_height) for layout bookkeeping.
     fn render_right(&mut self, area: Rect, buf: &mut ratatui::prelude::Buffer) -> (u16, u16) {
         let [top, bottom] =
-            Layout::vertical([Constraint::Length(8), Constraint::Fill(1)]).areas(area);
+            Layout::vertical([Constraint::Length(10), Constraint::Fill(1)]).areas(area);
 
         self.render_cursor_panel(top, buf);
         self.render_tree(bottom, buf);
@@ -757,6 +819,11 @@ impl HexViewer {
             ]));
         }
 
+        if self.layout.is_recognized()
+            && let Some(error) = self.layout.error()
+        {
+            lines.push(Line::from(format!("note   : {error}")));
+        }
         Paragraph::new(lines)
             .style(text_style)
             .wrap(Wrap { trim: false })
@@ -798,7 +865,7 @@ impl HexViewer {
         let total = visible.len();
         let h = inner.height as usize;
         if total == 0 {
-            Paragraph::new("(empty)")
+            Paragraph::new(self.layout.error().unwrap_or("(empty)"))
                 .style(sub_style)
                 .render(inner, buf);
             return;
@@ -830,7 +897,17 @@ impl HexViewer {
             } else {
                 "  "
             };
-            let span_label = format!("{indent}{marker}{}", n.label);
+            let span_label = if n.label.contains("@0x") {
+                format!("{indent}{marker}{}", n.label)
+            } else {
+                format!(
+                    "{indent}{marker}{}  [0x{:x}, 0x{:x}) · {} B",
+                    n.label,
+                    n.span.start,
+                    n.span.end,
+                    n.span.end.saturating_sub(n.span.start)
+                )
+            };
             let style = if i == self.tree_sel && self.focus == Focus::Tree {
                 sel_style
             } else {
@@ -898,4 +975,535 @@ fn byte_style(
         s = s.add_modifier(Modifier::BOLD);
     }
     s
+}
+
+impl HexViewer {
+    fn selected_offset(&self) -> u64 {
+        if self.focus == Focus::Tree {
+            self.layout
+                .tree()
+                .get(self.tree_sel)
+                .map(|n| n.span.start)
+                .unwrap_or(self.cursor.pos)
+        } else {
+            self.cursor.pos
+        }
+    }
+
+    fn follow_reference(&mut self) {
+        let offset = self.selected_offset();
+        let target = match &self.layout {
+            FileLayout::Parquet(p) => p
+                .references
+                .iter()
+                .filter(|r| r.source.contains(&offset))
+                .min_by_key(|r| r.source.end - r.source.start)
+                .map(|r| r.target.start)
+                .or_else(|| {
+                    p.references
+                        .iter()
+                        .filter(|r| r.target.contains(&offset))
+                        .min_by_key(|r| r.target.end - r.target.start)
+                        .map(|r| r.source.start)
+                }),
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.history.push(NavigationPosition {
+                offset: self.cursor.pos,
+                scroll: self.scroll,
+                tree_sel: self.tree_sel,
+                tree_scroll: self.tree_scroll,
+                focus: self.focus,
+                collapsed: self.collapsed.clone(),
+            });
+            self.jump_to(target);
+            if let Some((idx, _)) = self
+                .layout
+                .tree()
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.span.contains(&target))
+                .min_by_key(|(_, n)| n.span.end - n.span.start)
+            {
+                self.tree_sel = idx;
+                self.ensure_node_visible(idx);
+            }
+        }
+    }
+
+    fn return_reference(&mut self) {
+        if let Some(pos) = self.history.pop() {
+            self.cursor.goto(pos.offset);
+            self.scroll = pos.scroll;
+            self.tree_sel = pos.tree_sel;
+            self.tree_scroll = pos.tree_scroll;
+            self.focus = pos.focus;
+            self.collapsed = pos.collapsed;
+        }
+    }
+
+    fn open_detail(&mut self) {
+        let offset = self.selected_offset();
+        let page = if let FileLayout::Parquet(p) = &self.layout {
+            p.regions
+                .iter()
+                .find(|r| {
+                    r.kind == crate::binary::parquet::RegionKind::PageHeader
+                        && r.span.contains(&offset)
+                })
+                .map(|r| r.span.start)
+                .or_else(|| {
+                    p.tree
+                        .iter()
+                        .find(|n| n.label.starts_with("Page ") && n.span.contains(&offset))
+                        .map(|n| n.span.start)
+                })
+        } else {
+            None
+        };
+        if let Some(offset) = page {
+            let result = if let Some(index) = self
+                .detail_cache
+                .iter()
+                .position(|(key, _, _)| *key == offset)
+            {
+                let cached = self.detail_cache.remove(index).unwrap();
+                let page = Arc::clone(&cached.1);
+                self.detail_cache.push_back(cached);
+                Ok(page)
+            } else {
+                self.source
+                    .read_range(0, self.source.len() as usize)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| decode_page(&bytes, offset))
+                    .map(|page| {
+                        let cost = page
+                            .decompressed
+                            .capacity()
+                            .saturating_add(
+                                page.controls
+                                    .iter()
+                                    .chain(page.values.iter())
+                                    .map(|s| s.capacity())
+                                    .sum::<usize>(),
+                            )
+                            .saturating_add(
+                                (page.controls.capacity() + page.values.capacity())
+                                    .saturating_mul(std::mem::size_of::<String>()),
+                            );
+                        let page = Arc::new(page);
+                        while self
+                            .detail_cache
+                            .iter()
+                            .map(|x| x.2)
+                            .sum::<usize>()
+                            .saturating_add(cost)
+                            > MAX_DETAIL_CACHE
+                            && !self.detail_cache.is_empty()
+                        {
+                            self.detail_cache.pop_front();
+                        }
+                        if cost <= MAX_DETAIL_CACHE {
+                            self.detail_cache
+                                .push_back((offset, Arc::clone(&page), cost));
+                        }
+                        page
+                    })
+            };
+            let (page, text) = match result {
+                Ok(page) => (Some(page), vec![]),
+                Err(error) => (None, vec![error]),
+            };
+            self.detail = Some(DetailView {
+                title: format!("Page @0x{offset:x}"),
+                field_range: None,
+                page,
+                text,
+                tab: 0,
+                scroll: [0; 3],
+                horizontal: 0,
+            });
+        } else if let Some(node) = if self.focus == Focus::Tree {
+            self.layout.tree().get(self.tree_sel)
+        } else {
+            self.layout
+                .tree()
+                .iter()
+                .filter(|n| n.span.contains(&offset))
+                .min_by_key(|n| n.span.end - n.span.start)
+        } {
+            self.detail = Some(DetailView {
+                title: "Field details".into(),
+                field_range: Some(node.span.clone()),
+                page: None,
+                text: vec![
+                    node.label.clone(),
+                    format!(
+                        "file [0x{:x}, 0x{:x}) · {} B",
+                        node.span.start,
+                        node.span.end,
+                        node.span.end.saturating_sub(node.span.start)
+                    ),
+                ],
+                tab: 0,
+                scroll: [0; 3],
+                horizontal: 0,
+            });
+        }
+    }
+
+    fn handle_detail(&mut self, event: KeyEvent) -> bool {
+        if event.code == KeyCode::Esc || event.code == KeyCode::Char('q') {
+            self.detail = None;
+            return true;
+        }
+        let Some(detail) = &mut self.detail else {
+            return false;
+        };
+        match event.code {
+            KeyCode::Tab => {
+                detail.tab = (detail.tab + 1) % 3;
+                detail.horizontal = 0;
+            }
+            KeyCode::BackTab => {
+                detail.tab = (detail.tab + 2) % 3;
+                detail.horizontal = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                detail.scroll[detail.tab] = detail.scroll[detail.tab].saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                detail.scroll[detail.tab] = detail.scroll[detail.tab].saturating_add(1)
+            }
+            KeyCode::PageUp => {
+                detail.scroll[detail.tab] =
+                    detail.scroll[detail.tab].saturating_sub(self.visible_rows.max(1) as usize)
+            }
+            KeyCode::PageDown => {
+                detail.scroll[detail.tab] =
+                    detail.scroll[detail.tab].saturating_add(self.visible_rows.max(1) as usize)
+            }
+            KeyCode::Home => {
+                detail.scroll[detail.tab] = 0;
+                detail.horizontal = 0;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                detail.horizontal = detail.horizontal.saturating_add(8)
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                detail.horizontal = detail.horizontal.saturating_sub(8)
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn render_detail(&mut self, area: Rect, buf: &mut ratatui::prelude::Buffer) {
+        let Some(detail) = &mut self.detail else {
+            return;
+        };
+        let tab = if detail.page.is_some() {
+            ["Decompressed hex", "Controls", "Decoded values"][detail.tab]
+        } else {
+            ["Field value", "Encoded field hex", "Field value"][detail.tab]
+        };
+        let block = Block::default().borders(Borders::ALL).title(format!(
+            " {} · {} · Tab switch · Esc return ",
+            detail.title, tab
+        ));
+        let inner = block.inner(area);
+        block.render(area, buf);
+        self.visible_rows = inner.height;
+        let header = detail
+            .page
+            .as_ref()
+            .map(|page| {
+                format!(
+                    "Source file [0x{:x}, 0x{:x}); offsets below are in decompressed page bytes",
+                    page.source_span.start, page.source_span.end
+                )
+            })
+            .unwrap_or_else(|| "Field details · Tab: full encoded bytes (including Thrift header) · ←/→: long values".into());
+        let mut lines = vec![Line::from(header)];
+        let h = inner.height.saturating_sub(1) as usize;
+        let count = match &detail.page {
+            Some(page) => match detail.tab {
+                0 => page.decompressed.len().div_ceil(BYTES_PER_ROW),
+                1 => page.controls.len(),
+                _ => page.values.len(),
+            },
+            None => {
+                if detail.tab == 1 {
+                    detail
+                        .field_range
+                        .as_ref()
+                        .map(|r| (r.end - r.start).div_ceil(BYTES_PER_ROW as u64) as usize)
+                        .unwrap_or(detail.text.len())
+                } else {
+                    detail.text.len()
+                }
+            }
+        };
+        detail.scroll[detail.tab] = detail.scroll[detail.tab].min(count.saturating_sub(h.max(1)));
+        let start = detail.scroll[detail.tab];
+        if let Some(page) = &detail.page {
+            if detail.tab == 0 {
+                let byte_start = start * BYTES_PER_ROW;
+                let byte_end = byte_start
+                    .saturating_add(h * BYTES_PER_ROW)
+                    .min(page.decompressed.len());
+                for row in rows(
+                    &page.decompressed[byte_start.min(byte_end)..byte_end],
+                    byte_start as u64,
+                ) {
+                    lines.push(Line::from(format!(
+                        "page+0x{:08x}  {}  {}",
+                        row.offset,
+                        row.bytes
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        row.bytes
+                            .iter()
+                            .map(|b| format_ascii(*b))
+                            .collect::<String>()
+                    )));
+                }
+            } else {
+                let values = if detail.tab == 1 {
+                    &page.controls
+                } else {
+                    &page.values
+                };
+                lines.extend(
+                    values
+                        .iter()
+                        .skip(start)
+                        .take(h)
+                        .map(|v| Line::from(v.chars().skip(detail.horizontal).collect::<String>())),
+                );
+            }
+        } else if detail.tab == 1
+            && let Some(range) = detail.field_range.as_ref()
+        {
+            let offset = range
+                .start
+                .saturating_add((start * BYTES_PER_ROW) as u64)
+                .min(range.end);
+            let length = (h * BYTES_PER_ROW).min((range.end - offset) as usize);
+            match self.source.read_range(offset, length) {
+                Ok(bytes) => {
+                    for row in rows(&bytes, offset) {
+                        lines.push(Line::from(format!(
+                            "file+0x{:08x}  {}  {}",
+                            row.offset,
+                            row.bytes
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            row.bytes
+                                .iter()
+                                .map(|b| format_ascii(*b))
+                                .collect::<String>()
+                        )));
+                    }
+                }
+                Err(error) => lines.push(Line::from(error.to_string())),
+            }
+        } else {
+            lines.extend(
+                detail
+                    .text
+                    .iter()
+                    .skip(start)
+                    .take(h)
+                    .map(|v| Line::from(v.chars().skip(detail.horizontal).collect::<String>())),
+            );
+        }
+        Paragraph::new(lines)
+            .style(theme().text())
+            .render(inner, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binary::parquet::{MetaNode, ParquetLayout, Reference};
+
+    fn navigation_viewer() -> HexViewer {
+        let mut viewer = HexViewer::from_bytes("test", vec![0; 100]);
+        let layout = ParquetLayout {
+            is_parquet: true,
+            tree: vec![
+                MetaNode {
+                    depth: 0,
+                    label: "data".into(),
+                    span: 10..20,
+                    collapsible: false,
+                },
+                MetaNode {
+                    depth: 0,
+                    label: "metadata".into(),
+                    span: 70..90,
+                    collapsible: true,
+                },
+                MetaNode {
+                    depth: 1,
+                    label: "offset".into(),
+                    span: 75..77,
+                    collapsible: false,
+                },
+            ],
+            references: vec![Reference {
+                source: 75..77,
+                target: 10..20,
+            }],
+            ..ParquetLayout::default()
+        };
+        viewer.layout = FileLayout::Parquet(layout);
+        viewer
+    }
+
+    #[test]
+    fn references_return_to_exact_navigation_state() {
+        let mut viewer = navigation_viewer();
+        viewer.focus = Focus::Tree;
+        viewer.tree_sel = 2;
+        viewer.cursor.goto(76);
+        viewer.scroll = 3;
+        viewer.follow_reference();
+        assert_eq!(viewer.cursor.pos, 10);
+        assert_eq!(viewer.tree_sel, 0);
+        viewer.handle(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(viewer.cursor.pos, 76);
+        assert_eq!(viewer.tree_sel, 2);
+        assert_eq!(viewer.scroll, 3);
+        assert_eq!(viewer.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn detail_navigation_does_not_move_underlying_file() {
+        let mut viewer = navigation_viewer();
+        viewer.focus = Focus::Tree;
+        viewer.tree_sel = 2;
+        viewer.cursor.goto(76);
+        viewer.open_detail();
+        assert!(viewer.detail.is_some());
+        viewer.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        viewer.handle(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        viewer.handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(viewer.detail.is_none());
+        assert_eq!(viewer.cursor.pos, 76);
+        assert_eq!(viewer.tree_sel, 2);
+    }
+
+    #[test]
+    fn field_details_read_past_label_preview() {
+        let mut viewer = HexViewer::from_bytes("binary", vec![0xab; 512]);
+        viewer.layout = FileLayout::Parquet(ParquetLayout {
+            tree: vec![MetaNode {
+                depth: 0,
+                label: "binary preview".into(),
+                span: 0..512,
+                collapsible: false,
+            }],
+            ..ParquetLayout::default()
+        });
+        viewer.focus = Focus::Tree;
+        viewer.open_detail();
+        let detail = viewer.detail.as_mut().unwrap();
+        detail.tab = 1;
+        detail.scroll[1] = 25;
+        let area = Rect::new(0, 0, 140, 6);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        viewer.render_detail(area, &mut buffer);
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("file+0x00000190"));
+        assert!(text.contains("ab ab ab"));
+    }
+
+    #[test]
+    fn offset_input_accepts_detail_and_reference_shortcut_characters() {
+        let mut viewer = navigation_viewer();
+        viewer.handle(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        viewer.handle(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        viewer.handle(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert!(viewer.detail.is_none());
+        assert!(viewer.goto_input.as_ref().unwrap().value().contains("df"));
+    }
+
+    #[test]
+    fn large_file_skips_structure_before_full_read() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(MAX_STRUCTURE_BYTES + 1).unwrap();
+        let viewer = HexViewer::open_path(file.path()).unwrap();
+        assert!(matches!(viewer.layout, FileLayout::Unknown { .. }));
+        assert!(
+            viewer
+                .layout
+                .error()
+                .unwrap()
+                .contains("Structure parsing skipped")
+        );
+        assert!(viewer.regions.is_empty());
+    }
+
+    #[test]
+    fn detail_render_marks_derived_address_space() {
+        let mut viewer = navigation_viewer();
+        viewer.detail = Some(DetailView {
+            title: "Page".into(),
+            field_range: None,
+            page: Some(Arc::new(PageDetails {
+                source_span: 10..20,
+                decompressed: vec![1, 2],
+                controls: vec!["bit_width=2".into()],
+                values: vec!["value=1".into()],
+            })),
+            text: vec![],
+            tab: 0,
+            scroll: [0; 3],
+            horizontal: 0,
+        });
+        let area = Rect::new(0, 0, 140, 12);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        viewer.render_detail(area, &mut buffer);
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Source file [0xa, 0x14)"));
+        assert!(text.contains("page+0x00000000"));
+        viewer.handle_detail(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        viewer.render_detail(area, &mut buffer);
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains("bit_width=2")
+        );
+    }
+
+    #[test]
+    fn equal_span_parent_is_expanded_for_reference_selection() {
+        let mut viewer = navigation_viewer();
+        if let FileLayout::Parquet(p) = &mut viewer.layout {
+            p.tree[1].span = 75..77;
+        }
+        viewer.collapsed.insert(1);
+        viewer.ensure_node_visible(2);
+        assert!(!viewer.collapsed.contains(&1));
+    }
 }

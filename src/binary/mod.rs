@@ -5,6 +5,9 @@ pub mod hex;
 pub mod lance;
 pub mod layout;
 pub mod parquet;
+pub mod parquet_decode;
 pub mod protobuf;
 pub mod source;
 pub mod thrift;
+
+mod parquet_schema;

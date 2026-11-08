@@ -82,6 +82,7 @@ polars = { version = "0.55.2", features = [
     "strings",
 ] }
 polars-sql = "0.55.2"
+polars-parquet = { version = "=0.55.2", features = ["compression"] }
 rand = "0.10.2"
 ratatui = { version = "0.30.2", features = ["serde", "unstable-rendered-line-info"] }
 rayon = "1.12.0"
