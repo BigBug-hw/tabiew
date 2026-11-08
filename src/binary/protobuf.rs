@@ -12,10 +12,10 @@ use std::ops::Range;
 /// Protobuf wire types (low 3 bits of the tag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PbWireType {
-    Varint = 0,        // int32, int64, uint32, uint64, sint32, sint64, bool, enum
-    SixtyFourBit = 1,  // fixed64, sfixed64, double
+    Varint = 0,          // int32, int64, uint32, uint64, sint32, sint64, bool, enum
+    SixtyFourBit = 1,    // fixed64, sfixed64, double
     LengthDelimited = 2, // string, bytes, embedded messages, packed repeated
-    ThirtyTwoBit = 5,  // fixed32, sfixed32, float
+    ThirtyTwoBit = 5,    // fixed32, sfixed32, float
 }
 
 impl PbWireType {
@@ -41,6 +41,8 @@ pub struct PbField {
 #[derive(Debug, Clone)]
 pub struct PbValue {
     pub span: Range<u64>,
+    /// Value bytes, excluding tag and the length prefix for length-delimited fields.
+    pub payload_span: Range<u64>,
     pub wire_type: PbWireType,
     pub data: PbData,
 }
@@ -80,6 +82,7 @@ impl PbValue {
     pub fn as_string(&self) -> Option<&str> {
         match &self.data {
             PbData::String(s) => Some(s),
+            PbData::Bytes(b) => std::str::from_utf8(b).ok(),
             _ => None,
         }
     }
@@ -103,208 +106,114 @@ pub enum PbData {
     String(String),
 }
 
-/// Decode a Protobuf message starting at `offset` within `bytes` (relative to `base`).
-/// Returns (fields, span) where span covers the entire decoded message.
+/// Decode exactly the bounded message in `bytes[offset..]`.
 ///
-/// Safety limits: MAX_DEPTH=64, MAX_LIST_LEN=1_000_000, MAX_BINARY_LEN=64MiB.
-/// Returns `None` on malformed input or limit exceeded — never panics.
+/// Length-delimited fields remain raw bytes: only the schema can distinguish
+/// strings, packed scalars, bytes and embedded messages. To decode a known
+/// embedded message, pass its bytes and `payload_span.start` as the base.
+/// Invalid tags, truncated fields and absolute-offset overflow return `None`.
 pub fn decode_message_span_at(
     bytes: &[u8],
     base: u64,
     offset: u64,
 ) -> Option<(Vec<PbField>, Range<u64>)> {
-    let off = offset as usize;
-    if off > bytes.len() {
-        return None;
+    let off = usize::try_from(offset).ok()?;
+    let input = bytes.get(off..)?;
+    let start = base.checked_add(offset)?;
+    let end = start.checked_add(u64::try_from(input.len()).ok()?)?;
+    let mut dec = Decoder {
+        bytes: input,
+        base: start,
+        pos: 0,
+    };
+    let mut fields = Vec::new();
+    while dec.pos < input.len() {
+        if fields.len() >= MAX_FIELDS {
+            return None;
+        }
+        fields.push(dec.read_field()?);
     }
-    let mut dec = Decoder::new(&bytes[off..], base + offset);
-    let fields = dec.read_message(0)?;
-    let span = dec.abs(0)..dec.abs(dec.pos);
-    Some((fields, span))
+    Some((fields, start..end))
 }
 
 struct Decoder<'a> {
     bytes: &'a [u8],
-    /// Absolute offset of `bytes[0]` in the original file.
     base: u64,
-    /// Current cursor within `bytes`.
     pos: usize,
-    /// Depth guard.
-    depth: u32,
 }
-
-const MAX_DEPTH: u32 = 64;
 const MAX_BINARY_LEN: usize = 64 * 1024 * 1024;
+const MAX_FIELDS: usize = 1_000_000;
 
 impl<'a> Decoder<'a> {
-    fn new(bytes: &'a [u8], base: u64) -> Self {
-        Self {
-            bytes,
-            base,
-            pos: 0,
-            depth: 0,
-        }
-    }
-
     fn abs(&self, pos: usize) -> u64 {
+        // The entire input range was checked before constructing the decoder.
         self.base + pos as u64
     }
-
     fn read_byte(&mut self) -> Option<u8> {
         let b = *self.bytes.get(self.pos)?;
         self.pos += 1;
         Some(b)
     }
-
     fn read_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.pos.checked_add(n)? > self.bytes.len() {
-            return None;
-        }
-        let s = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
-        Some(s)
+        let end = self.pos.checked_add(n)?;
+        let bytes = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        Some(bytes)
     }
-
-    /// Unsigned varint (Protobuf uses base-128 varint, not zigzag).
     fn read_varint(&mut self) -> Option<u64> {
-        let mut result: u64 = 0;
-        let mut shift: u32 = 0;
-        loop {
+        let mut result = 0u64;
+        for shift in (0..70).step_by(7) {
             let b = self.read_byte()?;
-            result |= ((b & 0x7f) as u64) << shift;
+            if shift == 63 && b > 1 {
+                return None;
+            }
+            result |= u64::from(b & 0x7f) << shift;
             if b & 0x80 == 0 {
                 return Some(result);
             }
-            shift += 7;
-            if shift >= 64 {
-                return None;
-            }
         }
+        None
     }
-
-    /// Read a single field (tag + value) and return the field.
     fn read_field(&mut self) -> Option<PbField> {
         let start = self.pos;
         let tag = self.read_varint()?;
-        let number = (tag >> 3) as u32;
-        let wire_type = PbWireType::from_u8((tag & 0x07) as u8)?;
-
+        let number = tag >> 3;
+        if number == 0 || number > 0x1fff_ffff {
+            return None;
+        }
+        let wire_type = PbWireType::from_u8((tag & 7) as u8)?;
+        let payload_start;
         let data = match wire_type {
-            PbWireType::Varint => Some(PbData::Varint(self.read_varint()?)),
+            PbWireType::Varint => {
+                payload_start = self.pos;
+                PbData::Varint(self.read_varint()?)
+            }
             PbWireType::SixtyFourBit => {
-                let raw = self.read_bytes(8)?;
-                Some(PbData::Fixed64(u64::from_le_bytes(raw.try_into().ok()?)))
+                payload_start = self.pos;
+                PbData::Fixed64(u64::from_le_bytes(self.read_bytes(8)?.try_into().ok()?))
+            }
+            PbWireType::ThirtyTwoBit => {
+                payload_start = self.pos;
+                PbData::Fixed32(u32::from_le_bytes(self.read_bytes(4)?.try_into().ok()?))
             }
             PbWireType::LengthDelimited => {
-                // Could be a nested message or a string/bytes.
-                // We try to decode as message first; if it looks like a message
-                // (contains valid field tags), return Message; otherwise String/Bytes.
-                let len = self.read_varint()? as usize;
+                let len = usize::try_from(self.read_varint()?).ok()?;
                 if len > MAX_BINARY_LEN {
                     return None;
                 }
-                let data_start = self.pos;
-                let data_end = data_start + len;
-
-                // Peek: try to decode as nested message. Only accept it as a
-                // message if (1) we are within the depth limit, (2) the nested
-                // decode consumes *exactly* `len` bytes, and (3) at least one
-                // field was decoded. Otherwise fall back to string/bytes — a
-                // length-delimited value that merely *looks* like a valid
-                // message (e.g. ASCII text whose bytes happen to form tags)
-                // must not be misinterpreted.
-                if self.depth < MAX_DEPTH && len > 0 {
-                    let saved_pos = self.pos;
-                    let saved_depth = self.depth;
-                    self.depth += 1;
-                    let nested = self.read_message_inner(len);
-                    self.depth = saved_depth;
-                    if let Some(fields) = nested {
-                        if !fields.is_empty() && self.pos == data_end {
-                            return Some(PbField {
-                                number,
-                                value: PbValue {
-                                    span: self.abs(start)..self.abs(self.pos),
-                                    wire_type,
-                                    data: PbData::Message(fields),
-                                },
-                            });
-                        }
-                    }
-                    self.pos = saved_pos;
-                }
-
-                // Not a valid message — store as string/bytes.
-                let data = self.read_bytes(len)?.to_vec();
-                if let Ok(s) = std::str::from_utf8(&data) {
-                    Some(PbData::String(s.to_string()))
-                } else {
-                    Some(PbData::Bytes(data))
-                }
+                payload_start = self.pos;
+                PbData::Bytes(self.read_bytes(len)?.to_vec())
             }
-            PbWireType::ThirtyTwoBit => {
-                let raw = self.read_bytes(4)?;
-                Some(PbData::Fixed32(u32::from_le_bytes(raw.try_into().ok()?)))
-            }
-        }?;
-
+        };
         Some(PbField {
-            number,
+            number: number as u32,
             value: PbValue {
                 span: self.abs(start)..self.abs(self.pos),
+                payload_span: self.abs(payload_start)..self.abs(self.pos),
                 wire_type,
                 data,
             },
         })
-    }
-
-    /// Read a message (sequence of fields) with depth tracking.
-    fn read_message(&mut self, limit: usize) -> Option<Vec<PbField>> {
-        if self.depth >= MAX_DEPTH {
-            return None;
-        }
-        self.depth += 1;
-        let fields = self.read_message_inner(limit);
-        self.depth -= 1;
-        fields
-    }
-
-    /// Read fields until EOF or `limit` bytes consumed.
-    ///
-    /// Returns `None` if a field header was partially consumed and then failed
-    /// (e.g. a length-delimited field whose declared length exceeds the
-    /// safety cap) — that indicates corruption rather than a clean end of
-    /// message, so callers can fall back to string/bytes or surface an error.
-    fn read_message_inner(&mut self, limit: usize) -> Option<Vec<PbField>> {
-        let start = self.pos;
-        let mut fields = Vec::new();
-        loop {
-            if self.pos >= self.bytes.len() {
-                break;
-            }
-            if limit > 0 && self.pos - start >= limit {
-                break;
-            }
-            // Peek at the tag — if it's 0, we've hit corruption or end.
-            if self.bytes.get(self.pos) == Some(&0) {
-                break;
-            }
-            let field_start = self.pos;
-            match self.read_field() {
-                Some(field) => fields.push(field),
-                None => {
-                    // If we consumed any bytes before failing, the input is
-                    // malformed (not a clean EOF). For a nested message this
-                    // signals the parent to fall back to string/bytes; for the
-                    // top-level it surfaces as a decode failure.
-                    if self.pos > field_start {
-                        return None;
-                    }
-                    break;
-                }
-            }
-        }
-        Some(fields)
     }
 }
 
@@ -365,7 +274,10 @@ mod tests {
         let bytes = [0x0a, 0x07, 0x12, 0x05, b'i', b'n', b'n', b'e', b'r'];
         let (fields, _span) = decode_message_span_at(&bytes, 0, 0).unwrap();
         assert_eq!(fields.len(), 1);
-        let inner = fields[0].value.as_message().unwrap();
+        let value = &fields[0].value;
+        let (inner, inner_span) =
+            decode_message_span_at(value.as_bytes().unwrap(), value.payload_span.start, 0).unwrap();
+        assert_eq!(inner_span, 2..9);
         assert_eq!(inner.len(), 1);
         assert_eq!(inner[0].number, 2);
         assert_eq!(inner[0].value.as_string(), Some("inner"));
@@ -419,5 +331,56 @@ mod tests {
         buf.push(v as u8);
         bytes.extend_from_slice(&buf);
         assert!(decode_message_span_at(&bytes, 0, 0).is_none());
+    }
+    #[test]
+    fn strings_that_look_like_messages_remain_bytes() {
+        for text in ["mtime", "hi", "hello", ""] {
+            let mut bytes = vec![0x12, text.len() as u8];
+            bytes.extend_from_slice(text.as_bytes());
+            let (fields, span) = decode_message_span_at(&bytes, 100, 0).unwrap();
+            assert!(matches!(fields[0].value.data, PbData::Bytes(_)));
+            assert_eq!(fields[0].value.as_bytes(), Some(text.as_bytes()));
+            assert_eq!(fields[0].value.as_string(), Some(text));
+            assert_eq!(fields[0].value.payload_span, 102..span.end);
+        }
+    }
+    #[test]
+    fn rejects_bad_tags_and_trailing_zero() {
+        for bytes in [
+            vec![0],
+            vec![8, 1, 0],
+            vec![1; 9],
+            vec![0x0b],
+            vec![0x80, 0x80, 0x80, 0x80, 0x10, 0],
+        ] {
+            assert!(decode_message_span_at(&bytes, 0, 0).is_none(), "{bytes:?}");
+        }
+    }
+    #[test]
+    fn rejects_truncation_and_varint_overflow() {
+        for bytes in [
+            vec![8],
+            vec![10, 2, 1],
+            vec![13, 1],
+            vec![9, 1, 2],
+            [vec![8], vec![0xff; 9], vec![2]].concat(),
+        ] {
+            assert!(decode_message_span_at(&bytes, 0, 0).is_none(), "{bytes:?}");
+        }
+    }
+    #[test]
+    fn validates_absolute_range_and_empty_payload() {
+        assert!(decode_message_span_at(&[8, 1], u64::MAX, 0).is_none());
+        assert!(decode_message_span_at(&[8, 1], u64::MAX - 1, 1).is_none());
+        let (fields, span) = decode_message_span_at(&[10, 0], 10, 0).unwrap();
+        assert_eq!(span, 10..12);
+        assert_eq!(fields[0].value.payload_span, 12..12);
+        assert_eq!(fields[0].value.as_bytes(), Some([].as_slice()));
+        assert!(
+            decode_message_span_at(fields[0].value.as_bytes().unwrap(), 12, 0)
+                .unwrap()
+                .0
+                .is_empty()
+        );
     }
 }

@@ -11,3 +11,5 @@ pub mod source;
 pub mod thrift;
 
 mod parquet_schema;
+
+mod lance_schema;

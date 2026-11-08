@@ -164,6 +164,13 @@ and the Thrift footer. Metadata fields use the official Parquet names and map to
 their actual encoded byte ranges. Offsets are hexadecimal and ranges are
 `[start, end)`; unknown gaps remain explicitly unidentified.
 
+Lance files show data buffers, global buffers, column metadata, offset tables,
+and the footer in physical order. Protobuf fields use official names; encoding
+metadata is interpreted by its declared type URL, with unknown types retained
+as raw bytes. Column/page buffer references can be followed in both directions.
+Lance field details expose the complete encoded field bytes; page-value
+decoding described below applies to Parquet.
+
 Press `f` to follow an offset reference (or return from data to its metadata),
 and `Alt-Left` to return to the previous location. Press `d` on a page to inspect
 its decompressed hex, encoding controls, levels, dictionary indices, and decoded
@@ -181,7 +188,7 @@ raw hex; their structure is not loaded into memory.
 # Open a parquet file and inspect its byte layout / structure
 tw --hex data.parquet
 
-# Any file works; non-parquet files just show the hex pane
+# Any file works; other unrecognized formats show the raw hex pane
 tw --hex /bin/ls
 
 # Pipe bytes on stdin

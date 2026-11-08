@@ -940,6 +940,8 @@ fn default_collapsed(layout: &FileLayout) -> std::collections::HashSet<usize> {
         // Metadatas" parent and the encoding subtrees.
         if n.label.starts_with("ColumnMetadata[")
             || n.label.starts_with("Page[")
+            || (layout.format() == crate::binary::layout::Format::Lance
+                && n.label.starts_with("pages["))
             || n.label.starts_with("Column Metadatas")
             || n.label.starts_with("encoding (")
             || n.label.starts_with("direct (DirectEncoding)")
@@ -992,22 +994,23 @@ impl HexViewer {
 
     fn follow_reference(&mut self) {
         let offset = self.selected_offset();
-        let target = match &self.layout {
-            FileLayout::Parquet(p) => p
-                .references
-                .iter()
-                .filter(|r| r.source.contains(&offset))
-                .min_by_key(|r| r.source.end - r.source.start)
-                .map(|r| r.target.start)
-                .or_else(|| {
-                    p.references
-                        .iter()
-                        .filter(|r| r.target.contains(&offset))
-                        .min_by_key(|r| r.target.end - r.target.start)
-                        .map(|r| r.source.start)
-                }),
-            _ => None,
+        let references = match &self.layout {
+            FileLayout::Parquet(layout) => layout.references.as_slice(),
+            FileLayout::Lance(layout) => layout.references.as_slice(),
+            FileLayout::Unknown { .. } => &[],
         };
+        let target = references
+            .iter()
+            .filter(|r| r.source.contains(&offset))
+            .min_by_key(|r| r.source.end - r.source.start)
+            .map(|r| r.target.start)
+            .or_else(|| {
+                references
+                    .iter()
+                    .filter(|r| r.target.contains(&offset))
+                    .min_by_key(|r| r.target.end - r.target.start)
+                    .map(|r| r.source.start)
+            });
         if let Some(target) = target {
             self.history.push(NavigationPosition {
                 offset: self.cursor.pos,
@@ -1505,5 +1508,30 @@ mod tests {
         viewer.collapsed.insert(1);
         viewer.ensure_node_visible(2);
         assert!(!viewer.collapsed.contains(&1));
+    }
+    #[test]
+    fn lance_buffer_reference_navigation_and_field_details() {
+        let bytes = include_bytes!("../../tests/fixtures/dentry.lance");
+        let mut viewer = HexViewer::from_bytes("dentry.lance", bytes.to_vec());
+        let (source, target) = match &viewer.layout {
+            FileLayout::Lance(layout) => {
+                assert!(layout.error.is_none(), "{:?}", layout.error);
+                let reference = layout
+                    .references
+                    .iter()
+                    .find(|r| r.target.start == 0)
+                    .unwrap();
+                (reference.source.start, reference.target.start)
+            }
+            _ => panic!("expected Lance"),
+        };
+        viewer.cursor.goto(source);
+        viewer.follow_reference();
+        assert_eq!(viewer.cursor.pos, target);
+        viewer.return_reference();
+        assert_eq!(viewer.cursor.pos, source);
+        viewer.open_detail();
+        assert!(viewer.detail.is_some());
+        assert!(viewer.detail.as_ref().unwrap().page.is_none());
     }
 }
